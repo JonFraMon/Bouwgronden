@@ -9,10 +9,12 @@ Hoe het werkt (de "pijplijn"):
   2. Kadastrale percelen ophalen        (GRB - Adp, WFS)
   3. Alleen percelen in woongebied      (gewestplan, WFS)
   4. Percelen met een gebouw schrappen  (GRB - Gbg, WFS)
-  5. Te kleine percelen schrappen       (MIN_OPPERVLAKTE)
-  6. Afstanden berekenen tot scholen, supermarkten, station,
+  5. Te kleine/grote percelen schrappen (MIN_/MAX_OPPERVLAKTE)
+  6. Alleen open bebouwing (schatting)  (breedte + vrijstaande buurhuizen)
+  7. Afstanden berekenen tot scholen, supermarkten, station,
      dorpskern en drukke wegen          (OpenStreetMap, Overpass API)
-  7. Score 0-100 per perceel en exporteren naar CSV + interactieve kaart
+  8. Dichtstbijzijnd adres per perceel  (Adressenregister, WFS)
+  9. Score 0-100 per perceel en exporteren naar CSV + interactieve kaart
 
 WFS = "Web Feature Service": een standaard geo-API. Je vraagt een kaartlaag
 op binnen een rechthoek (bbox) en krijgt vormen terug (hier als GeoJSON).
@@ -25,6 +27,7 @@ Gebruik:
 
 import argparse
 import sys
+import time
 import xml.etree.ElementTree as ET
 from io import BytesIO
 
@@ -39,9 +42,17 @@ from shapely.geometry import LineString, Point
 # ---------------------------------------------------------------------------
 GEMEENTEN = ["Duffel", "Kontich", "Lint", "Sint-Katelijne-Waver"]
 
-MIN_OPPERVLAKTE = 400       # m², kleinere percelen vallen af
+MIN_OPPERVLAKTE = 550       # m², kleinere percelen vallen af
+MAX_OPPERVLAKTE = 1000      # m², grotere percelen vallen af (weides, grote tuinen)
 IDEALE_OPPERVLAKTE = 1000   # m², vanaf hier volle punten voor oppervlakte
 MAX_GEBOUW_M2 = 15          # m² gebouw op perceel toegestaan (tuinhuisje, ruis)
+
+# Open bebouwing (vrijstaand). Geen dataset zegt dit voor lege percelen, dus
+# we schatten het: zijn de huizen in de buurt vrijstaand, en is het perceel
+# breed genoeg voor een huis met 3 m vrije strook aan beide kanten?
+MIN_BREEDTE = 15            # m, korte zijde van het perceel
+OPEN_STRAAL = 100           # m rond het perceel waarin we buurhuizen bekijken
+MIN_PCT_OPEN = 70           # % van die buurhuizen dat vrijstaand moet zijn
 TOP_N = 10                  # hoeveel percelen in de shortlist
 
 # Gewicht van elk criterium in de eindscore (hoeft niet op te tellen tot 1)
@@ -82,8 +93,21 @@ SERVICES = {
     "gebouwen":   {"url": "https://geo.api.vlaanderen.be/GRB/wfs",
                    "zoek": ["gbg"], "laag": None},
     "bestemming": {"url": "https://www.mercator.vlaanderen.be/raadpleegdienstenmercatorpubliek/wfs",
-                   "zoek": ["gwp", "gewestplan"], "laag": None},
+                   "zoek": ["gwp", "gewestplan"], "laag": "lu:lu_gwp_gv"},
+    "adressen":   {"url": "https://geo.api.vlaanderen.be/Adressenregister/wfs",
+                   "zoek": ["adres"], "laag": "Adressenregister:Adres"},
 }
+
+# Achtergrondkaarten van Digitaal Vlaanderen (WMTS). De tegelservers van
+# OpenStreetMap zelf blokkeren kaarten die als lokaal bestand geopend worden.
+WMTS_TEGEL = ("https://geo.api.vlaanderen.be/{dienst}/wmts?SERVICE=WMTS&REQUEST=GetTile"
+              "&VERSION=1.0.0&LAYER={laag}&STYLE=&FORMAT=image/png"
+              "&TILEMATRIXSET=GoogleMapsVL&TILEMATRIX={{z}}&TILEROW={{y}}&TILECOL={{x}}")
+ACHTERGRONDEN = {
+    "Basiskaart (GRB)": WMTS_TEGEL.format(dienst="GRB", laag="grb_bsk"),
+    "Luchtfoto":        WMTS_TEGEL.format(dienst="OMWRGBMRVL", laag="omwrgbmrvl"),
+}
+ADRES_STATUSSEN = ["InGebruik", "Voorgesteld"]   # geen gehistoreerde adressen
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 HEADERS = {"User-Agent": "bouwgrond-shortlist/1.0 (persoonlijk gebruik)"}
@@ -213,6 +237,29 @@ def filter_onbebouwd(percelen, gebouwen):
     return percelen.drop(index=bebouwd)
 
 
+def breedte(geom):
+    """Korte zijde van de kleinste rechthoek rond het perceel: ruwe maat voor
+    de breedte. Meet de vorm, niet de echte straatkant."""
+    hoeken = list(geom.minimum_rotated_rectangle.exterior.coords)
+    return min(Point(hoeken[i]).distance(Point(hoeken[i + 1])) for i in range(2))
+
+
+def pct_open_buurt(percelen, gebouwen):
+    """% hoofdgebouwen binnen OPEN_STRAAL m dat vrijstaand is (geen ander
+    hoofdgebouw raakt). Leeg (NaN) als er geen huizen in de buurt staan."""
+    huizen = gebouwen.loc[gebouwen["LBLTYPE"] == "hoofdgebouw", ["geometry"]]
+    huizen = huizen.reset_index(drop=True)
+    # 0,2 m marge: aanpalende huizen delen een muur, maar de tekening is niet altijd exact
+    marge = huizen.assign(geometry=huizen.buffer(0.2))
+    raakt = gpd.sjoin(huizen, marge, predicate="intersects")
+    raakt = raakt[raakt.index != raakt["index_right"]]
+    huizen["open"] = ~huizen.index.isin(raakt.index)
+
+    zones = percelen[["geometry"]].assign(geometry=percelen.buffer(OPEN_STRAAL))
+    buren = gpd.sjoin(zones, huizen, predicate="intersects")
+    return (buren.groupby(level=0)["open"].mean() * 100).reindex(percelen.index)
+
+
 def osm_ophalen(bbox_lambert, marge=3000):
     """Haal voorzieningen en drukke wegen op uit OpenStreetMap."""
     t = Transformer.from_crs(CRS, "EPSG:4326", always_xy=True)
@@ -230,7 +277,15 @@ def osm_ophalen(bbox_lambert, marge=3000):
     out geom;"""
 
     def vraag(q):
-        r = requests.post(OVERPASS_URL, data={"data": q}, headers=HEADERS, timeout=300)
+        # Overpass is een gratis vrijwilligersdienst die vaak vol zit (502/504/429).
+        # De dienst vraagt dan zelf om opnieuw te proberen met steeds langer wachten.
+        for poging, wacht in enumerate([30, 60, 120, 240, None], start=1):
+            r = requests.post(OVERPASS_URL, data={"data": q}, headers=HEADERS, timeout=300)
+            if r.status_code not in (429, 502, 503, 504) or wacht is None:
+                break
+            print(f"  Overpass is druk ({r.status_code}), poging {poging}: "
+                  f"opnieuw over {wacht} s...")
+            time.sleep(wacht)
         r.raise_for_status()
         return r.json()["elements"]
 
@@ -269,6 +324,18 @@ def afstand_tot(percelen, doelen):
     return res.groupby(level=0)["afstand"].min()
 
 
+def adres_dichtbij(percelen, adressen):
+    """Dichtstbijzijnd officieel adres per perceel, plus de afstand ernaartoe.
+    Onbebouwde percelen hebben zelden een eigen adres; afstand 0 betekent dat
+    het adres op het perceel zelf ligt, anders is het meestal dat van de buren."""
+    adressen = adressen[adressen["AdresStatus"].isin(ADRES_STATUSSEN)]
+    res = gpd.sjoin_nearest(percelen[["geometry"]],
+                            adressen[["VolledigAdres", "geometry"]],
+                            distance_col="afstand")
+    res = res[~res.index.duplicated()]   # gelijke afstand (bv. busnummers): eerste houden
+    return res["VolledigAdres"], res["afstand"]
+
+
 def lineair(waarde, goed, slecht):
     """1 als waarde <= goed, 0 als >= slecht, rechte lijn ertussen."""
     if waarde <= goed:
@@ -296,15 +363,23 @@ def kaart_maken(df, pad):
     import folium
     geo = df.to_crs("EPSG:4326")
     midden = geo.geometry.union_all().centroid
-    m = folium.Map(location=[midden.y, midden.x], zoom_start=13, tiles="OpenStreetMap")
+    m = folium.Map(location=[midden.y, midden.x], zoom_start=13, tiles=None)
+    for naam, url in ACHTERGRONDEN.items():
+        folium.TileLayer(url, name=naam, attr="© Digitaal Vlaanderen",
+                         max_zoom=21).add_to(m)
     id_kol = next((c for c in df.columns if "capakey" in c.lower()), None)
     for rang, (_, rij) in enumerate(geo.iterrows(), start=1):
         top = rang <= TOP_N
         kleur = "#d7301f" if top else "#3182bd"
+        adres = rij["adres"]
+        if rij["afst_adres"] >= 1:
+            adres += f" (dichtstbij, {rij['afst_adres']:.0f} m)"
         info = (f"<b>#{rang} — score {rij['score']}</b><br>"
                 f"{'CaPaKey: ' + str(rij[id_kol]) + '<br>' if id_kol else ''}"
+                f"Adres: {adres}<br>"
                 f"Gemeente: {rij['gemeente']}<br>"
-                f"Oppervlakte: {rij['oppervlakte_m2']:.0f} m²<br>"
+                f"Oppervlakte: {rij['oppervlakte_m2']:.0f} m² · Breedte: {rij['breedte_m']:.0f} m<br>"
+                f"Vrijstaande huizen in de buurt: {rij['pct_open_buurt']:.0f}%<br>"
                 f"Centrum: {rij['afst_centrum']:.0f} m · Station: {rij['afst_station']:.0f} m<br>"
                 f"School: {rij['afst_school']:.0f} m · Supermarkt: {rij['afst_supermarkt']:.0f} m<br>"
                 f"Drukke weg: {rij['afst_drukke_weg']:.0f} m")
@@ -313,6 +388,7 @@ def kaart_maken(df, pad):
                            "color": k, "weight": 3 if t else 1,
                            "fillOpacity": 0.6 if t else 0.25},
                        popup=folium.Popup(info, max_width=320)).add_to(m)
+    folium.LayerControl().add_to(m)   # knop rechtsboven: basiskaart of luchtfoto
     m.save(pad)
 
 
@@ -356,27 +432,41 @@ def main():
     print(f"  {len(perc)} percelen in woongebied")
 
     print("4. Gebouwen")
-    perc = filter_onbebouwd(perc, wfs_ophalen("gebouwen", bbox))
+    gebouwen = wfs_ophalen("gebouwen", bbox)
+    perc = filter_onbebouwd(perc, gebouwen)
     print(f"  {len(perc)} onbebouwde percelen")
 
     print("5. Oppervlakte")
     perc["oppervlakte_m2"] = perc.geometry.area
-    perc = perc[perc["oppervlakte_m2"] >= MIN_OPPERVLAKTE].copy()
-    print(f"  {len(perc)} percelen van minstens {MIN_OPPERVLAKTE} m²")
+    perc = perc[perc["oppervlakte_m2"].between(MIN_OPPERVLAKTE, MAX_OPPERVLAKTE)].copy()
+    print(f"  {len(perc)} percelen tussen {MIN_OPPERVLAKTE} en {MAX_OPPERVLAKTE} m²")
     if perc.empty:
-        sys.exit("Geen percelen over. Verlaag MIN_OPPERVLAKTE of controleer de filters.")
+        sys.exit("Geen percelen over. Verruim MIN/MAX_OPPERVLAKTE of controleer de filters.")
+
+    print("6. Open bebouwing (schatting)")
+    perc["breedte_m"] = perc.geometry.apply(breedte)
+    perc["pct_open_buurt"] = pct_open_buurt(perc, gebouwen)
+    perc = perc[(perc["breedte_m"] >= MIN_BREEDTE)
+                & (perc["pct_open_buurt"] >= MIN_PCT_OPEN)].copy()
+    print(f"  {len(perc)} percelen van minstens {MIN_BREEDTE} m breed, in een buurt "
+          f"met minstens {MIN_PCT_OPEN}% vrijstaande huizen")
+    if perc.empty:
+        sys.exit("Geen percelen over. Verlaag MIN_BREEDTE of MIN_PCT_OPEN.")
 
     gem_punten = perc.representative_point().to_frame("geometry").set_geometry("geometry")
     perc["gemeente"] = gpd.sjoin(gem_punten, gem[[naam_kol, "geometry"]],
                                  predicate="within")[naam_kol]
 
-    print("6. Voorzieningen (OpenStreetMap)")
+    print("7. Voorzieningen (OpenStreetMap)")
     pois, wegen = osm_ophalen(bbox)
     for soort in AFSTANDEN:
         perc[f"afst_{soort}"] = afstand_tot(perc, pois[pois["soort"] == soort])
     perc["afst_drukke_weg"] = afstand_tot(perc, wegen)
 
-    print("7. Score en export")
+    print("8. Adressen (Adressenregister)")
+    perc["adres"], perc["afst_adres"] = adres_dichtbij(perc, wfs_ophalen("adressen", bbox))
+
+    print("9. Score en export")
     resultaat = scoren(perc)
     resultaat.insert(0, "rang", range(1, len(resultaat) + 1))
     resultaat.drop(columns="geometry").to_csv("bouwgronden_alle.csv", index=False)
